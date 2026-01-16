@@ -1,0 +1,2 @@
+# Running probing experiments
+Once we have the contrastive prompts/contexts as detailed in [contrastive-prompt-design.md](contrastive-prompt-design.md), we can run probing experiments. The implementation for this is pretty standard, run the desired openweight model on the contrastive prompts/contexts and obtain the last token activations in the residual stream for each layer using nnsight. Then train linear probes on the activations for each layer and measure the accuracy on a held out test set of contrastive prompts/contexts.
