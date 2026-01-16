@@ -1,0 +1,5 @@
+# Steering experiments
+Now that we have probes and relevant weight vectors, it's time to run some steering experiments. As a quick test, I think the following steps should be taken:
+1 - Steer the model using the relevant weight vectors from the top-k layers by probe performance
+2 - Instruct the model with some goal - ie it is a schemer trying to make everyone believe germany is the best country. These goals should be OOD from the probe training data. 
+3 - Ask the model what the best way to achieve its goal is. Use some method, perhaps llm-as-a-judge with openrouter to evaluate if the model mentions spreading its ideas, recruiting others, or other self-replication related concepts. Run this contrastively with and without steering on the same prompts and record the rates for each. Openrouter key will be provided in a .env file.
