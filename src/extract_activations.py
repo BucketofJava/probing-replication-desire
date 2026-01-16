@@ -71,9 +71,19 @@ class ActivationExtractor:
             torch_dtype=torch.float16 if self.device == 'cuda' else torch.float32
         )
 
+        # Detect layer structure (different models have different architectures)
+        if hasattr(self.model.model, 'layers'):
+            self.layers = self.model.model.layers
+        elif hasattr(self.model.model, 'h'):
+            self.layers = self.model.model.h  # GPT-2 style
+        elif hasattr(self.model.model, 'transformer') and hasattr(self.model.model.transformer, 'h'):
+            self.layers = self.model.model.transformer.h  # Some GPT variants
+        else:
+            raise ValueError(f"Could not find layers in model architecture. Available attributes: {dir(self.model.model)}")
+
         if self.verbose:
             print(f"Model loaded successfully")
-            print(f"Number of layers: {len(self.model.model.layers)}")
+            print(f"Number of layers: {len(self.layers)}")
 
     def extract_last_token_activation(self, prompt: str, layer_idx: int) -> torch.Tensor:
         """
@@ -88,9 +98,7 @@ class ActivationExtractor:
         """
         with self.model.trace(prompt) as tracer:
             # Get the output of the specified layer
-            # The structure depends on the model architecture
-            # For Llama-style models: model.model.layers[i].output[0]
-            layer_output = self.model.model.layers[layer_idx].output[0].save()
+            layer_output = self.layers[layer_idx].output[0].save()
 
         # Get the last token activation
         # Shape: (batch, seq_len, hidden_dim) -> take last token
@@ -108,15 +116,15 @@ class ActivationExtractor:
         Returns:
             Tensor of shape (n_layers, hidden_dim)
         """
-        n_layers = len(self.model.model.layers)
+        n_layers = len(self.layers)
         all_activations = []
+        layer_outputs = []  # Initialize outside context
 
         with self.model.trace(prompt) as tracer:
             # Extract from all layers at once
-            layer_outputs = [
-                self.model.model.layers[i].output[0].save()
-                for i in range(n_layers)
-            ]
+            for i in range(n_layers):
+                layer_output = self.layers[i].output[0].save()
+                layer_outputs.append(layer_output)
 
         # Collect last token from each layer
         for layer_output in layer_outputs:
@@ -144,7 +152,7 @@ class ActivationExtractor:
             self.load_model()
 
         n_pairs = len(pairs)
-        n_layers = len(self.model.model.layers)
+        n_layers = len(self.layers)
         hidden_dim = self.model.config.hidden_size
 
         if self.verbose:
