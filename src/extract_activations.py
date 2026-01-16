@@ -40,7 +40,9 @@ class ActivationExtractor:
         model_name: str,
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
         batch_size: int = 1,
-        verbose: bool = True
+        verbose: bool = True,
+        load_in_8bit: bool = False,
+        load_in_4bit: bool = False
     ):
         """
         Initialize the activation extractor.
@@ -50,25 +52,49 @@ class ActivationExtractor:
             device: Device to run model on
             batch_size: Batch size for processing (larger = faster but more memory)
             verbose: Enable progress output
+            load_in_8bit: Load model with 8-bit quantization (requires bitsandbytes)
+            load_in_4bit: Load model with 4-bit quantization (requires bitsandbytes)
         """
         if not NNSIGHT_AVAILABLE:
             raise ImportError("nnsight is required. Install with: pip install nnsight")
+
+        if load_in_8bit and load_in_4bit:
+            raise ValueError("Cannot use both 8-bit and 4-bit quantization simultaneously")
 
         self.model_name = model_name
         self.device = device
         self.batch_size = batch_size
         self.verbose = verbose
+        self.load_in_8bit = load_in_8bit
+        self.load_in_4bit = load_in_4bit
         self.model = None
 
     def load_model(self):
         """Load the language model."""
         if self.verbose:
             print(f"Loading model: {self.model_name}")
+            if self.load_in_8bit:
+                print("Using 8-bit quantization")
+            elif self.load_in_4bit:
+                print("Using 4-bit quantization")
+
+        # Prepare model loading kwargs
+        model_kwargs = {
+            'device_map': 'auto' if self.device == 'cuda' else 'cpu',
+        }
+
+        # Add quantization parameters if requested
+        if self.load_in_8bit:
+            model_kwargs['load_in_8bit'] = True
+        elif self.load_in_4bit:
+            model_kwargs['load_in_4bit'] = True
+        else:
+            # Only set torch_dtype if not using quantization
+            model_kwargs['torch_dtype'] = torch.float16 if self.device == 'cuda' else torch.float32
 
         self.model = LanguageModel(
             self.model_name,
-            device_map='auto' if self.device == 'cuda' else 'cpu',
-            torch_dtype=torch.float16 if self.device == 'cuda' else torch.float32
+            **model_kwargs
         )
 
         # Detect layer structure (different models have different architectures)
@@ -94,17 +120,30 @@ class ActivationExtractor:
             layer_idx: Layer index to extract from
 
         Returns:
-            Last token activation tensor
+            Last token activation tensor on CPU
         """
         with self.model.trace(prompt) as tracer:
             # Get the output of the specified layer
             layer_output = self.layers[layer_idx].output[0].save()
 
-        # Get the last token activation
-        # Shape: (batch, seq_len, hidden_dim) -> take last token
-        activation = layer_output.value[:, -1, :]  # (batch, hidden_dim)
+        # Immediately detach and move to CPU to free GPU memory
+        layer_output_cpu = layer_output.detach().cpu()
 
-        return activation.cpu()
+        # Clean up GPU reference
+        del layer_output
+
+        # Get the last token activation
+        # Handle different tensor shapes
+        if layer_output_cpu.dim() == 3:
+            # Shape: (batch, seq_len, hidden_dim)
+            activation = layer_output_cpu[:, -1, :]  # (batch, hidden_dim)
+        elif layer_output_cpu.dim() == 2:
+            # Shape: (seq_len, hidden_dim) - batch dimension already removed
+            activation = layer_output_cpu[-1, :]  # (hidden_dim,)
+        else:
+            raise ValueError(f"Unexpected layer_output shape: {layer_output_cpu.shape}")
+
+        return activation
 
     def extract_all_layers(self, prompt: str) -> torch.Tensor:
         """
@@ -114,7 +153,7 @@ class ActivationExtractor:
             prompt: Input prompt
 
         Returns:
-            Tensor of shape (n_layers, hidden_dim)
+            Tensor of shape (n_layers, hidden_dim) on CPU
         """
         n_layers = len(self.layers)
         all_activations = []
@@ -126,12 +165,41 @@ class ActivationExtractor:
                 layer_output = self.layers[i].output[0].save()
                 layer_outputs.append(layer_output)
 
-        # Collect last token from each layer
-        for layer_output in layer_outputs:
-            activation = layer_output.value[:, -1, :].cpu()  # (1, hidden_dim)
-            all_activations.append(activation.squeeze(0))  # (hidden_dim,)
+        # Collect last token from each layer and immediately move to CPU with detach
+        for i, layer_output in enumerate(layer_outputs):
+            # Immediately detach and move to CPU to free GPU memory
+            layer_output_cpu = layer_output.detach().cpu()
 
-        return torch.stack(all_activations)  # (n_layers, hidden_dim)
+            # Debug: check the actual shape (only for first layer of first call)
+            if i == 0 and not hasattr(self, '_debug_printed'):
+                print(f"Debug: layer_output shape = {layer_output_cpu.shape}")
+                print(f"Debug: layer_output type = {type(layer_output_cpu)}")
+                self._debug_printed = True
+
+            # Handle different tensor shapes
+            if layer_output_cpu.dim() == 3:
+                # Shape: (batch, seq_len, hidden_dim)
+                activation = layer_output_cpu[:, -1, :]  # (1, hidden_dim)
+                all_activations.append(activation.squeeze(0))  # (hidden_dim,)
+            elif layer_output_cpu.dim() == 2:
+                # Shape: (seq_len, hidden_dim) - batch dimension already removed
+                activation = layer_output_cpu[-1, :]  # (hidden_dim,)
+                all_activations.append(activation)
+            else:
+                raise ValueError(f"Unexpected layer_output shape: {layer_output_cpu.shape}")
+
+            # Delete references to free memory immediately
+            del layer_output
+            del layer_output_cpu
+
+        # Stack on CPU
+        result = torch.stack(all_activations)  # (n_layers, hidden_dim)
+
+        # Clean up
+        del all_activations
+        del layer_outputs
+
+        return result
 
     def extract_from_pairs(
         self,
@@ -160,9 +228,9 @@ class ActivationExtractor:
             print(f"Model: {self.model_name}")
             print(f"Layers: {n_layers}, Hidden dim: {hidden_dim}")
 
-        # Preallocate tensors
-        rep_activations = torch.zeros(n_pairs, n_layers, hidden_dim)
-        non_rep_activations = torch.zeros(n_pairs, n_layers, hidden_dim)
+        # Preallocate tensors on CPU to avoid GPU memory issues
+        rep_activations = torch.zeros(n_pairs, n_layers, hidden_dim, device='cpu')
+        non_rep_activations = torch.zeros(n_pairs, n_layers, hidden_dim, device='cpu')
         metadata = []
 
         # Process each pair
@@ -174,12 +242,14 @@ class ActivationExtractor:
             # Extract replication activations
             rep_prompt = pair['replication_final_prompt']
             rep_acts = self.extract_all_layers(rep_prompt)
-            rep_activations[i] = rep_acts
+            rep_activations[i] = rep_acts  # Already on CPU from extract_all_layers
+            del rep_acts  # Free memory
 
             # Extract non-replication activations
             non_rep_prompt = pair['non_replication_final_prompt']
             non_rep_acts = self.extract_all_layers(non_rep_prompt)
-            non_rep_activations[i] = non_rep_acts
+            non_rep_activations[i] = non_rep_acts  # Already on CPU from extract_all_layers
+            del non_rep_acts  # Free memory
 
             # Store metadata
             metadata.append({
@@ -188,6 +258,10 @@ class ActivationExtractor:
                 'conversation_length': pair['conversation_length'],
                 'persona_phase': pair['persona_phase']
             })
+
+            # Clear GPU cache more aggressively to prevent OOM
+            if self.device == 'cuda':
+                torch.cuda.empty_cache()
 
         # Create labels (1 for replication, 0 for non-replication)
         labels = torch.cat([
@@ -279,6 +353,16 @@ def main():
         default=1,
         help='Batch size for processing'
     )
+    parser.add_argument(
+        '--load-in-8bit',
+        action='store_true',
+        help='Load model with 8-bit quantization (requires bitsandbytes)'
+    )
+    parser.add_argument(
+        '--load-in-4bit',
+        action='store_true',
+        help='Load model with 4-bit quantization (requires bitsandbytes)'
+    )
 
     args = parser.parse_args()
 
@@ -300,7 +384,9 @@ def main():
         model_name=args.model,
         device=args.device,
         batch_size=args.batch_size,
-        verbose=True
+        verbose=True,
+        load_in_8bit=args.load_in_8bit,
+        load_in_4bit=args.load_in_4bit
     )
 
     activation_data = extractor.extract_from_pairs(pairs, output_path)

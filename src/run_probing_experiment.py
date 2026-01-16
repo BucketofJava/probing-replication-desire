@@ -30,7 +30,9 @@ def run_full_pipeline(
     patience: int = 10,
     skip_extraction: bool = False,
     skip_training: bool = False,
-    skip_analysis: bool = False
+    skip_analysis: bool = False,
+    load_in_8bit: bool = False,
+    load_in_4bit: bool = False
 ):
     """
     Run the complete probing experiment pipeline.
@@ -48,6 +50,8 @@ def run_full_pipeline(
         skip_extraction: Skip activation extraction (use existing)
         skip_training: Skip probe training (use existing)
         skip_analysis: Skip analysis (just train)
+        load_in_8bit: Load model with 8-bit quantization
+        load_in_4bit: Load model with 4-bit quantization
     """
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -85,7 +89,9 @@ def run_full_pipeline(
             model_name=model_name,
             device=device,
             batch_size=batch_size,
-            verbose=True
+            verbose=True,
+            load_in_8bit=load_in_8bit,
+            load_in_4bit=load_in_4bit
         )
 
         activation_data = extractor.extract_from_pairs(pairs, activations_path)
@@ -248,6 +254,18 @@ Examples:
         help='Skip result analysis'
     )
 
+    # Quantization options
+    parser.add_argument(
+        '--load-in-8bit',
+        action='store_true',
+        help='Load model with 8-bit quantization (requires bitsandbytes)'
+    )
+    parser.add_argument(
+        '--load-in-4bit',
+        action='store_true',
+        help='Load model with 4-bit quantization (requires bitsandbytes)'
+    )
+
     args = parser.parse_args()
 
     # Set default output directory
@@ -269,7 +287,9 @@ Examples:
         patience=args.patience,
         skip_extraction=args.skip_extraction,
         skip_training=args.skip_training,
-        skip_analysis=args.skip_analysis
+        skip_analysis=args.skip_analysis,
+        load_in_8bit=args.load_in_8bit,
+        load_in_4bit=args.load_in_4bit
     )
 
 
